@@ -491,19 +491,68 @@ class SeqGrowGraph(MVXTwoStageDetector):
             f"range=({float(pred_nodes_xy.min()):.2f}, {float(pred_nodes_xy.max()):.2f})"
         ))
 
-        # ========== 阶段 5: 组装结果 ==========
-        # 同时生成旧格式的 line_results 用于兼容现有评估
-        line_results = self.simple_test_pts(bev_feats, img_metas)
+        # ========== 阶段 5: 坐标尺度缩放 ==========
+        # Diffusion 输出的坐标在特征图尺度（例如 8x22）
+        # 需要缩放到 BEV Grid 尺度（例如 128x192）
+        feat_H, feat_W = bev_feats.shape[-2:]
+        
+        # 从 grid_conf 计算目标 BEV Grid 尺寸
+        # grid_conf: xbound=[-48, 48, 0.5] → (48-(-48))/0.5 = 192
+        #            ybound=[-32, 32, 0.5] → (32-(-32))/0.5 = 128
+        target_W = int((self.pc_range[3] - self.pc_range[0]) / self.dx[0])
+        target_H = int((self.pc_range[4] - self.pc_range[1]) / self.dx[1])
+        
+        scale_x = target_W / max(feat_W, 1)
+        scale_y = target_H / max(feat_H, 1)
+        
+        debug_print('predict/scale', lambda: (
+            f"Coordinate scaling: feat({feat_H}x{feat_W}) → grid({target_H}x{target_W}), "
+            f"scale=({scale_x:.2f}, {scale_y:.2f})"
+        ))
+        
+        # 缩放坐标
+        pred_nodes_xy_scaled = pred_nodes_xy.clone()
+        pred_nodes_xy_scaled[..., 0] *= scale_x  # x 方向
+        pred_nodes_xy_scaled[..., 1] *= scale_y  # y 方向
+        
+        debug_print('predict/scaled', lambda: (
+            f"Scaled nodes_xy: range=({float(pred_nodes_xy_scaled.min()):.2f}, "
+            f"{float(pred_nodes_xy_scaled.max()):.2f})"
+        ))
+
+        # ========== 阶段 6: 组装结果（复用第一次生成的序列）==========
+        # 不再调用 simple_test_pts，避免重复推理导致序列不一致
+        line_results = []
+        for b_idx in range(B):
+            seq = pred_seqs[b_idx]
+            
+            # 截断到 End Token
+            if self.end in seq:
+                end_positions = (seq == self.end).nonzero(as_tuple=True)[0]
+                if len(end_positions) > 0:
+                    stop_idx = end_positions[0].item()
+                    seq_valid = seq[:stop_idx]
+                else:
+                    seq_valid = seq
+            else:
+                seq_valid = seq
+            
+            line_results.append(dict(
+                line_seqs=seq_valid.detach().cpu().numpy()
+            ))
         
         bbox_list = [dict() for _ in range(B)]
         for i, (res, ds, lr) in enumerate(zip(bbox_list, batch_data_samples, line_results)):
             res['line_results'] = lr
             res['token'] = ds.metainfo.get('token', None)
-            # 添加 Diffusion 生成的高精度节点坐标
-            res['pred_nodes_xy'] = pred_nodes_xy[i].detach().cpu().numpy()
+            
+            # 使用缩放后的坐标
+            scaled_coords = pred_nodes_xy_scaled[i].detach().cpu().numpy()
+            res['pred_nodes_xy'] = scaled_coords
             res['pred_seqs'] = pred_seqs[i].detach().cpu().numpy()
+            
             # 同时将坐标添加到 line_results 中，供评估器使用
-            lr['pred_nodes_xy'] = pred_nodes_xy[i].detach().cpu().numpy()
+            lr['pred_nodes_xy'] = scaled_coords
             lr['nodes_mask'] = nodes_mask[i].detach().cpu().numpy()
             
             # 可选：可视化第一个样本（使用 Diffusion 坐标）
